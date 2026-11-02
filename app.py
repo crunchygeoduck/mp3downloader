@@ -10,13 +10,14 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QPoint, QProcess, QProcessEnvironment, QSettings, QTimer, QUrl
+from PySide6.QtCore import Qt, QPoint, QProcess, QProcessEnvironment, QSettings, QTimer, QUrl, QStandardPaths, QSaveFile, QIODevice, QLockFile
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap, QPolygon
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QScrollArea, QSizePolicy, QSplitter, QVBoxLayout, QWidget)
+    QPushButton, QScrollArea, QSizePolicy, QSplitter, QVBoxLayout, QWidget, QDialog, QCheckBox)
 from downloader import parse_links, download_command, preview_command, tool_path
+from usability import VERSION, RELEASES, ISSUES, UPDATE_API, QUALITIES, newer_release, friendly_error
 
 PURPLE = '#6936cf'
 STYLE = '''
@@ -80,11 +81,18 @@ def panel(layout):
     return item
 
 
+def saved_queue_path():
+    return Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation)) / 'YTSCDownloader' / 'queue.json'
+
+
 class TrackCard(QFrame):
     def __init__(self, window, url, folder, quality):
         super().__init__()
         self.window, self.url, self.folder, self.quality = window, url, folder, quality
         self.state, self.file, self.cancelled = 'Queued', None, False
+        self.preview_info = {}
+        self.error_message = ''
+        self.resume_on_launch = False
         self.setObjectName('card')
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         outer = QVBoxLayout(self)
@@ -146,7 +154,17 @@ class TrackCard(QFrame):
         tools.addStretch()
         layout.addLayout(tools)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Wrapped titles, metadata, and friendly errors need enough card height
+        # even when the scroll area is narrow.
+        width = max(100, event.size().width() - 32 - 116 - 44 - 32)
+        text_height = sum(max(widget.sizeHint().height(), widget.heightForWidth(width))
+                          for widget in (self.title, self.subtitle, self.status))
+        self.setMinimumHeight(36 + max(116, text_height + 10 + 27) + 12 + self.download_button.sizeHint().height())
+
     def set_state(self, state):
+        changed = self.state != state
         self.state = state
         self.status.setText(state)
         self.download_button.setEnabled(state in {'Queued', 'Failed', 'Cancelled'})
@@ -163,6 +181,8 @@ class TrackCard(QFrame):
             self.percent.setText('100%' if state == 'Complete' else '—')
             self.status.setStyleSheet('color: ' + ('#23774b' if state == 'Complete' else '#a33746' if state == 'Failed' else '#6b6774') + ';')
         self.window.update_count()
+        if changed:
+            self.window.schedule_save()
 
     def metadata(self, info):
         if not isinstance(info, dict):
@@ -177,6 +197,9 @@ class TrackCard(QFrame):
                     if seconds >= 3600 else f'{seconds // 60}:{seconds % 60:02}') if seconds else 'Unknown duration'
         source = 'SoundCloud' if 'soundcloud.com' in self.url else 'YouTube'
         self.subtitle.setText(f"{source} · {info.get('uploader') or 'Audio'} · {duration}\n{self.quality}")
+        self.preview_info = {'title': self.title.text(), 'uploader': str(info.get('uploader') or 'Audio'),
+                             'duration': seconds, 'thumbnail': info.get('thumbnail') if isinstance(info.get('thumbnail'), str) else None}
+        self.window.schedule_save()
         if isinstance(info.get('thumbnail'), str) and info['thumbnail']:
             self.window.fetch_art(self, info['thumbnail'])
 
@@ -188,6 +211,8 @@ class TrackCard(QFrame):
         menu.addAction('Open original link', lambda: QDesktopServices.openUrl(QUrl(self.url)))
         menu.addAction('Open download folder', lambda: self.window.open_folder(self.folder))
         menu.addAction('Copy link', lambda: QApplication.clipboard().setText(self.url))
+        if self.state in {'Queued', 'Failed', 'Cancelled'}:
+            menu.addAction('Change save folder', lambda: self.window.change_item_folder(self))
         if self.state in {'Failed', 'Cancelled'}:
             menu.addAction('Retry', lambda: self.window.retry(self))
         if self.state in {'Complete', 'Failed', 'Cancelled', 'Queued', 'Waiting to download'}:
@@ -196,7 +221,7 @@ class TrackCard(QFrame):
 
 
 class App(QMainWindow):
-    def __init__(self):
+    def __init__(self, settings=None, state_path=None, enable_updates=True):
         super().__init__()
         self.items, self.active, self.process = [], None, None
         self.buffer, self.closing = '', False
@@ -204,11 +229,23 @@ class App(QMainWindow):
         self.preview_process = None
         self.preview_item = None
         self.preview_timeout_ms = 45000
-        self.settings = QSettings('LocalAudioTools', 'YTSCDownloader')
+        self.settings = settings if settings is not None else QSettings('LocalAudioTools', 'YTSCDownloader')
+        self.state_path = Path(state_path) if state_path else saved_queue_path()
+        self.restoring = False
+        self.save_timer = QTimer(self)
+        self.save_timer.setSingleShot(True)
+        self.save_timer.timeout.connect(self.save_queue)
+        self.update_reply = None
+        self.update_manual = False
         self.network = QNetworkAccessManager(self)
         self.setWindowTitle('YT & SC Downloader')
-        self.resize(1140, 760)
-        self.setMinimumSize(950, 740)
+        help_menu = self.menuBar().addMenu('Help')
+        help_menu.addAction('About / Getting started', self.show_help)
+        self.check_update_action = help_menu.addAction('Check for updates', lambda: self.check_for_updates(True))
+        help_menu.addAction('Download latest version', lambda: QDesktopServices.openUrl(QUrl(RELEASES)))
+        help_menu.addAction('Report a problem', lambda: QDesktopServices.openUrl(QUrl(ISSUES)))
+        self.resize(1140, 800)
+        self.setMinimumSize(950, 780)
         self.setAcceptDrops(True)
         icon = QPixmap(32, 32)
         icon.fill(QColor(PURPLE))
@@ -224,6 +261,9 @@ class App(QMainWindow):
         outer = QVBoxLayout(base)
         outer.setContentsMargins(16, 16, 16, 16)
         outer.setSpacing(12)
+        self.update_notice = button('', lambda: QDesktopServices.openUrl(QUrl(RELEASES)), 'primary')
+        self.update_notice.hide()
+        outer.addWidget(self.update_notice)
         self.split = QSplitter(Qt.Orientation.Vertical)
         outer.addWidget(self.split)
         top = QWidget()
@@ -263,7 +303,7 @@ class App(QMainWindow):
         left.addWidget(drop)
         left.addWidget(label('Quality'))
         self.quality = QComboBox()
-        self.quality.addItems(['320 kbps MP3', '256 kbps MP3', '192 kbps MP3', '128 kbps MP3', 'Best quality MP3'])
+        self.quality.addItems(QUALITIES)
         self.quality.setCurrentText(self.settings.value('quality', '320 kbps MP3'))
         self.quality.setAccessibleName('MP3 quality')
         left.addWidget(self.quality)
@@ -336,6 +376,157 @@ class App(QMainWindow):
         self.split.setSizes([510, 190])
         self.split.setChildrenCollapsible(False)
         self.write_log('Ready. Add YouTube videos or full SoundCloud track links.')
+        self.restore_queue()
+        if enable_updates and self.settings.value('automatic_updates', True, type=bool):
+            QTimer.singleShot(1500, lambda: self.check_for_updates(False))
+
+    def schedule_save(self):
+        if not self.restoring and not self.closing:
+            self.save_timer.start(250)
+
+    def save_queue(self):
+        self.save_timer.stop()
+        entries = []
+        for item in self.items:
+            if item.state == 'Complete':
+                continue
+            state = item.state if item.state in {'Failed', 'Cancelled'} and not item.resume_on_launch else 'Queued'
+            entries.append({'url': item.url, 'folder': str(item.folder), 'quality': item.quality,
+                            'state': state, 'metadata': item.preview_info, 'error': item.error_message})
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            output = QSaveFile(str(self.state_path))
+            if not output.open(QIODevice.OpenModeFlag.WriteOnly):
+                raise OSError(output.errorString())
+            content = json.dumps({'version': 1, 'items': entries}, ensure_ascii=False).encode('utf-8')
+            if output.write(content) != len(content) or not output.commit():
+                raise OSError(output.errorString())
+        except OSError as exc:
+            self.write_log(f'Could not save the queue: {exc}')
+
+    def restore_queue(self):
+        if not self.state_path.exists():
+            return
+        self.restoring = True
+        try:
+            data = json.loads(self.state_path.read_text(encoding='utf-8'))
+            if not isinstance(data, dict) or data.get('version') != 1 or not isinstance(data.get('items'), list):
+                raise ValueError('Unrecognized saved queue')
+            for entry in data['items']:
+                try:
+                    if not isinstance(entry, dict):
+                        continue
+                    url = entry['url']
+                    if not isinstance(url, str) or len(parse_links(url)) != 1:
+                        continue
+                    folder = entry['folder']
+                    if not isinstance(folder, str) or not Path(folder).is_absolute() or entry['quality'] not in QUALITIES:
+                        continue
+                    item = TrackCard(self, url, Path(folder), entry['quality'])
+                    self.items.append(item)
+                    self.cards.insertWidget(self.cards.count() - 1, item)
+                    item.set_state(entry.get('state') if entry.get('state') in {'Failed', 'Cancelled'} else 'Queued')
+                    if item.state == 'Failed' and isinstance(entry.get('error'), str):
+                        item.error_message = entry['error']
+                        item.status.setText(item.error_message or 'Failed — choose Retry')
+                    metadata = entry.get('metadata')
+                    if isinstance(metadata, dict) and metadata:
+                        item.metadata(metadata)
+                    elif item.state == 'Queued':
+                        self.preview_pending.append(item)
+                except (KeyError, TypeError, ValueError):
+                    continue
+            self.update_count()
+            if self.items:
+                self.write_log(f'Restored {len(self.items)} unfinished item(s). Choose Download when ready.')
+            QTimer.singleShot(0, self.start_preview)
+        except (OSError, ValueError) as exc:
+            self.write_log(f'Could not restore the queue: {exc}')
+            try:
+                self.state_path.rename(self.state_path.with_suffix(f'.invalid-{datetime.now():%Y%m%d-%H%M%S}.json'))
+            except OSError:
+                pass
+        finally:
+            self.restoring = False
+
+    def show_help(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle('About / Getting started')
+        dialog.setMinimumWidth(520)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(14)
+        layout.addWidget(label(f'YT & SC Downloader · v{VERSION}', 'heading'))
+        guide = label('1. Paste a YouTube video or full SoundCloud track link.\n'
+                      '2. Choose MP3 quality and a save folder.\n'
+                      '3. Use Add to Queue for later, or Download Now.\n'
+                      '4. Use Download All to process queued tracks in order.\n\n'
+                      'Unfinished tracks are saved on this PC and restored when you reopen the app. '
+                      'Restored tracks wait for you to start them.\n\n'
+                      'Public and unlisted YouTube videos and accessible SoundCloud tracks are supported. '
+                      'Private/sign-in-only content and playlists are not supported.\n\n'
+                      'If a download fails, read the message on its card and try Retry. '
+                      'Report a problem with your app version and relevant log lines; review logs for private links before sharing.')
+        guide.setWordWrap(True)
+        layout.addWidget(guide)
+        automatic = QCheckBox('Check for new releases automatically at startup')
+        automatic.setChecked(self.settings.value('automatic_updates', True, type=bool))
+        automatic.toggled.connect(lambda enabled: self.settings.setValue('automatic_updates', enabled))
+        layout.addWidget(automatic)
+        privacy = label('Update checks contact GitHub for the latest version. Your queue and links are not sent.', 'muted')
+        privacy.setWordWrap(True)
+        layout.addWidget(privacy)
+        row = QHBoxLayout()
+        row.addWidget(button('Check for updates', lambda: self.check_for_updates(True)))
+        row.addWidget(button('Report a problem', lambda: QDesktopServices.openUrl(QUrl(ISSUES))))
+        row.addWidget(button('Close', dialog.accept))
+        layout.addLayout(row)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def check_for_updates(self, manual=False):
+        if self.closing:
+            return
+        if not manual and not self.settings.value('automatic_updates', True, type=bool):
+            return
+        if self.update_reply:
+            self.update_manual = self.update_manual or manual
+            return
+        self.update_manual = manual
+        request = QNetworkRequest(QUrl(UPDATE_API))
+        request.setRawHeader(b'User-Agent', f'YTSCDownloader/{VERSION}'.encode())
+        request.setRawHeader(b'Accept', b'application/vnd.github+json')
+        request.setTransferTimeout(10000)
+        reply = self.network.get(request)
+        self.update_reply = reply
+        self.check_update_action.setEnabled(False)
+        def finished():
+            requested = self.update_manual
+            self.update_reply = None
+            self.update_manual = False
+            self.check_update_action.setEnabled(True)
+            try:
+                if self.closing:
+                    return
+                if reply.error() != reply.NetworkError.NoError:
+                    raise ValueError('Could not reach GitHub')
+                payload = json.loads(bytes(reply.readAll()).decode('utf-8'))
+                if not isinstance(payload, dict) or not isinstance(payload.get('tag_name'), str):
+                    raise ValueError('Unexpected update response')
+                version = newer_release(payload)
+                if version:
+                    self.update_notice.setText(f'{version} is available — open download page')
+                    self.update_notice.show()
+                    if requested:
+                        QMessageBox.information(self, 'Update available', f'{version} is available. Use the update banner to open its download page.')
+                elif requested:
+                    QMessageBox.information(self, 'Up to date', f'You are running v{VERSION}. No newer stable release is available.')
+            except (ValueError, UnicodeError):
+                if requested:
+                    QMessageBox.information(self, 'Could not check for updates', 'Check your internet connection and try again. You can also use Help → Download latest version.')
+            finally:
+                reply.deleteLater()
+        reply.finished.connect(finished)
 
     def paste(self):
         text = QApplication.clipboard().text().strip()
@@ -365,6 +556,15 @@ class App(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
         except OSError as exc:
             QMessageBox.warning(self, 'Cannot open folder', str(exc))
+
+    def change_item_folder(self, item):
+        if item not in self.items or item.state not in {'Queued', 'Failed', 'Cancelled'}:
+            return
+        folder = QFileDialog.getExistingDirectory(self, 'Save this track to', str(item.folder))
+        if folder:
+            item.folder = Path(folder).resolve()
+            self.write_log('Save folder updated for: ' + item.title.text())
+            self.schedule_save()
 
     def add_links(self, download=False):
         try:
@@ -401,6 +601,7 @@ class App(QMainWindow):
         self.update_count()
         self.start_next()
         self.start_preview()
+        self.schedule_save()
 
     def start_preview(self):
         if self.preview_process or self.closing:
@@ -483,6 +684,8 @@ class App(QMainWindow):
             self.log_hint.setText('Queued tracks ready to download' if any(i.state == 'Queued' for i in self.items) else 'Queue finished' if self.items else 'Ready')
             return
         self.active = item
+        item.resume_on_launch = False
+        self.error_lines = []
         self.cancel_preview(item)
         item.set_state('Fetching details…')
         quality = '0' if item.quality.startswith('Best') else item.quality.split()[0] + 'K'
@@ -506,6 +709,7 @@ class App(QMainWindow):
     def process_error(self, error):
         if error == QProcess.ProcessError.FailedToStart:
             self.write_log('Could not start downloader: ' + self.process.errorString())
+            self.error_lines.append('Could not start downloader: ' + self.process.errorString())
             self.finished(-1, QProcess.ExitStatus.CrashExit)
 
     def read_output(self):
@@ -542,6 +746,8 @@ class App(QMainWindow):
                     item.percent.setText('…')
         else:
             self.write_log(line)
+            self.error_lines.append(line)
+            self.error_lines = self.error_lines[-40:]
             if '[ExtractAudio]' in line and not item.cancelled:
                 item.set_state('Converting…')
 
@@ -555,7 +761,8 @@ class App(QMainWindow):
         state = 'Cancelled' if item.cancelled else 'Complete' if code == 0 else 'Failed'
         item.set_state(state)
         if state == 'Failed':
-            item.status.setText('Failed — see log or retry from ⋮')
+            item.error_message = friendly_error('\n'.join(self.error_lines))
+            item.status.setText(item.error_message)
         self.write_log(state + ': ' + item.title.text())
         proc = self.process
         self.process = None
@@ -606,6 +813,7 @@ class App(QMainWindow):
         if item not in self.items or item.state not in {'Failed', 'Cancelled'}:
             return
         item.cancelled = False
+        item.error_message = ''
         item.file = None
         item.cancel_button.setEnabled(True)
         item.status.setStyleSheet('color: #6936cf;')
@@ -622,6 +830,7 @@ class App(QMainWindow):
         item.hide()
         item.deleteLater()
         self.update_count()
+        self.schedule_save()
 
     def clear_finished(self):
         for item in list(self.items):
@@ -666,6 +875,9 @@ class App(QMainWindow):
             self.split.setSizes([510, 190])
 
     def closeEvent(self, event):
+        if not self.closing:
+            for item in self.items:
+                item.resume_on_launch = item.state not in {'Complete', 'Failed', 'Cancelled', 'Cancelling…'}
         self.closing = True
         self.preview_pending.clear()
         if self.preview_process:
@@ -676,6 +888,7 @@ class App(QMainWindow):
             self.cancel_all()
             event.ignore()
         else:
+            self.save_queue()
             event.accept()
 
 
@@ -686,6 +899,16 @@ if __name__ == '__main__':
     application = QApplication(sys.argv)
     application.setStyle('Fusion')
     application.setStyleSheet(STYLE)
+    try:
+        saved_queue_path().parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        QMessageBox.warning(None, 'Cannot save app data', f'Please check access to your local app-data folder.\n{exc}')
+        sys.exit(1)
+    instance_lock = QLockFile(str(saved_queue_path().with_suffix('.lock')))
+    instance_lock.setStaleLockTime(0)
+    if not instance_lock.tryLock(0):
+        QMessageBox.information(None, 'Already running', 'YT & SC Downloader is already open. Use the existing window to keep your saved queue together.')
+        sys.exit(0)
     window = App()
     window.show()
     sys.exit(application.exec())

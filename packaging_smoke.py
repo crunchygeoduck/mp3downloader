@@ -24,7 +24,7 @@ def run(directory):
         qt = QApplication.instance() or QApplication([])
         qt.setStyle('Fusion')
         qt.setStyleSheet(STYLE)
-        window = App()
+        window = App(state_path=target / 'queue.json', enable_updates=False)
         window.show()
         qt.processEvents()
         window.grab().save(str(target / 'window.png'))

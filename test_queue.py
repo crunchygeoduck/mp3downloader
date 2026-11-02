@@ -1,5 +1,6 @@
 """Queue interaction regression tests; uses short local workers, no downloads."""
 import sys
+import json
 import tempfile
 import time
 import unittest
@@ -23,8 +24,8 @@ class QueueTests(unittest.TestCase):
         self.exception_hook = patch('sys.excepthook', side_effect=lambda *error: self.callback_errors.append(error))
         self.exception_hook.start()
         self.temp = tempfile.TemporaryDirectory()
-        self.window = App()
-        self.window.settings = QSettings(str(Path(self.temp.name) / 'settings.ini'), QSettings.Format.IniFormat)
+        self.window = App(settings=QSettings(str(Path(self.temp.name) / 'settings.ini'), QSettings.Format.IniFormat),
+                          state_path=Path(self.temp.name) / 'queue.json', enable_updates=False)
         self.window.folder.setText(self.temp.name)
         self.started = []
         def command(url, *args):
@@ -235,6 +236,82 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(card.state, 'Queued')
         self.assertTrue(card.download_button.isEnabled())
         self.assertIn('unavailable', card.status.text())
+
+    def reopen(self):
+        settings, path = self.window.settings, self.window.state_path
+        self.window.close()
+        self.wait_idle()
+        self.window = App(settings=settings, state_path=path, enable_updates=False)
+
+    def test_saved_queue_restores_details_without_downloading(self):
+        card = self.add('saved')
+        self.wait_previews()
+        self.reopen()
+        self.assertEqual(len(self.window.items), 1)
+        restored = self.window.items[0]
+        self.assertEqual(restored.title.text(), 'Preview title')
+        self.assertEqual(restored.quality, card.quality)
+        self.assertEqual(restored.folder, Path(self.temp.name))
+        self.assertEqual(restored.state, 'Queued')
+        self.assertEqual(self.started, [])
+
+    def test_close_active_download_restores_it_as_queued(self):
+        with patch('app.download_command', return_value=[sys.executable, '-c', 'import time; time.sleep(30)']):
+            self.add('interrupted', now=True)
+            self.reopen()
+        self.assertEqual(self.window.items[0].state, 'Queued')
+        self.assertIsNone(self.window.process)
+
+    def test_user_cancelled_and_failed_items_keep_retry_state(self):
+        first = self.add('cancelled')
+        second = self.add('failed')
+        first.cancel_button.click()
+        second.set_state('Failed')
+        self.reopen()
+        self.assertEqual([item.state for item in self.window.items], ['Cancelled', 'Failed'])
+        self.assertTrue(all(item.download_button.text() == 'Retry' for item in self.window.items))
+
+    def test_completed_and_removed_cards_are_not_restored(self):
+        first = self.add('done', now=True)
+        self.wait_idle()
+        second = self.add('removed')
+        self.window.remove(second)
+        self.assertEqual(first.state, 'Complete')
+        self.reopen()
+        self.assertEqual(self.window.items, [])
+
+    def test_corrupt_saved_queue_is_backed_up(self):
+        self.window.close()
+        self.window.state_path.write_text('{broken', encoding='utf-8')
+        self.window = App(settings=self.window.settings, state_path=self.window.state_path, enable_updates=False)
+        self.assertEqual(self.window.items, [])
+        self.assertEqual(len(list(Path(self.temp.name).glob('queue.invalid-*.json'))), 1)
+
+    def test_invalid_saved_entries_are_skipped(self):
+        self.window.close()
+        entries = [None, {'url': 'https://example.com', 'folder': self.temp.name, 'quality': '320 kbps MP3'},
+                   {'url': 'https://youtu.be/valid', 'folder': self.temp.name, 'quality': '320 kbps MP3', 'metadata': {'title': 'Saved'}}]
+        self.window.state_path.write_text(json.dumps({'version': 1, 'items': entries}), encoding='utf-8')
+        self.window = App(settings=self.window.settings, state_path=self.window.state_path, enable_updates=False)
+        self.assertEqual(len(self.window.items), 1)
+        self.assertEqual(self.window.items[0].title.text(), 'Saved')
+
+    def test_friendly_error_is_displayed_after_failure(self):
+        with patch('app.download_command', return_value=[sys.executable, '-c', 'print("ERROR: Private video. Sign in required"); raise SystemExit(1)']):
+            card = self.add('private', now=True)
+            self.wait_idle()
+        self.assertIn('requires sign-in', card.status.text())
+        self.assertEqual(card.download_button.text(), 'Retry')
+
+    def test_card_save_folder_can_be_changed_before_retry(self):
+        card = self.add('new-folder')
+        card.cancel_button.click()
+        folder = Path(self.temp.name) / 'new'
+        folder.mkdir()
+        with patch('app.QFileDialog.getExistingDirectory', return_value=str(folder)):
+            self.window.change_item_folder(card)
+        self.reopen()
+        self.assertEqual(self.window.items[0].folder, folder)
 
 
 if __name__ == '__main__':

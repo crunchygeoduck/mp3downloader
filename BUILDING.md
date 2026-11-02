@@ -21,7 +21,7 @@ The licenses for the bundled versions are checked in under `packaging/licenses`.
 ## Verify and build
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest test_queue -v
+.\.venv\Scripts\python.exe -m unittest discover -v
 .\.venv\Scripts\python.exe build_exe.py
 ```
 
